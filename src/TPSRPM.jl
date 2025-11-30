@@ -1,7 +1,7 @@
 module TPSRPM # Thin Plate Splin Robust Point Matching
 
 using LinearAlgebra, Statistics
-export vc2mat, tps_rpm_apply, tps_rpm, show_pos, make_grid_points, infer_order
+export vc2mat, tps_rpm_apply, tps_rpm, show_pos, make_grid_points, infer_order, assigment_indices, visualize_result
 
 """
     vc2mat(vec)
@@ -221,7 +221,7 @@ end
 # --- TPS-RPM main loop ---
 """
     tps_rpm(X::AbstractMatrix, Y::AbstractMatrix;
-            beta_sched=collect(0.5:0.5:4.0),
+            beta_sched=collect(0.5:0.5:6.0),
             cout=1.0, λ=1e-3, iters_per_beta::Int=3, verbose=false,
             cout_src::Union{Nothing,Float64}=nothing,
             cout_dst::Union{Nothing,Float64}=nothing,
@@ -232,7 +232,10 @@ calculates an optimized thin-plate-spline (TPS) robust point matching (RPM) betw
 (moving) destination postions Y[M×2]. 
 
 # Parameters
-- beta_sched: vector of β values (increasing), e.g. 0.5:0.5:4.0
+- beta_sched: vector of β values (increasing, signifying the "inverse temperature"), e.g. 0.5:0.5:4.0
+The schedule of beta values to follow. The final beta determines how mucht the result corresponds to a permutation matrix.
+Anneal to very large β (i.e. a low temperature) to obtain a unique assiment.
+
 - cout: outlier cost for dummy column (used for source and destination if provided)
 - cout_src: outlier cost for dummy column sources
 - cout_dst: outlier cost for dummy column destination
@@ -249,7 +252,7 @@ The sources define the thin plate spline (TPS)
 Returns warp parameters (wx, wy, ax, ay), final soft matrix A, and diagnostics.
 
 """
-function tps_rpm(X::AbstractMatrix, Y::AbstractMatrix; beta_sched=collect(0.5:0.5:4.0),
+function tps_rpm(X::AbstractMatrix, Y::AbstractMatrix; beta_sched=collect(0.5:0.5:6.0),
                  cout=1.0, λ=1e-3, iters_per_beta::Int=3, verbose=false,
                  cout_src=nothing, cout_dst=nothing,
                  center::Bool=false, init::Symbol=:nothing)
@@ -352,17 +355,26 @@ end
 
 
 """
-    show_pos(sz, posmat)
+    show_pos(sz, posmat, idxpos)
 
-creates an image with the positions as dots
+creates an image with the positions as dots and filled by the index (if present) plus one.
+    This yields unassigned sources having the number one.
 """
-function show_pos(sz, posmat)
+function show_pos(sz, posmat, idxpos=1)
     res = zeros(sz)
+    n = 1
+    idxval = 0;
     for p in eachslice(posmat, dims=1)
         pos = round.(Int, p)
-        if (all(pos.>0) && all(pos .<= sz))
-            res[pos...] += 1;
+        if isa(idxpos, AbstractArray)
+            idxval = idxpos[n];
+        else
+            idxval = idxpos;
         end
+        if (all(pos.>0) && all(pos .<= sz))
+            res[pos...] = idxval+1;
+        end
+        n += 1;
     end
     return res
 end
@@ -375,16 +387,26 @@ end
 
 
 """
-    make_grid_points(inpts; mystep::Int=30)
+    make_grid_points(inpts, sz; mystep::Int=1)
 Create grid points over an image of size (H,W). order=:xy or :yx.
+
+# Parameters
+- inpts: input vector
+- sz: optional size to define the bounding box. If not given, the ranges are estimated by the bounding box of inpts.
 """
-function make_grid_points(inpts; mystep::Int=30)
-    xmin, ymin =  round.(Int,minimum(inpts,dims=1))
-    xmax, ymax =  round.(Int,maximum(inpts,dims=1))
-    stepx = xmin : mystep : xmax
+function make_grid_points(inpts, sz=nothing; gridstep::Int=1)
+    xmin = 1; xmax = 100; ymin=1; ymax=100;
+    if isnothing(sz)
+        xmin, ymin =  round.(Int,minimum(inpts,dims=1))
+        xmax, ymax =  round.(Int,maximum(inpts,dims=1))
+    else
+        xmax, ymax = sz
+    end
+    stepx = xmin : gridstep : xmax
     eachy = ymin:ymax
-    stepy = ymin : mystep : ymax
+    stepy = ymin : gridstep : ymax
     eachx = xmin:xmax
+
     pts = Matrix{Float64}(undef, length(stepx)*length(eachy)+length(stepy)*length(eachx), 2)
     k = 1
     @inbounds for y in eachy, x in stepx
@@ -396,6 +418,82 @@ function make_grid_points(inpts; mystep::Int=30)
         k+=1;
     end
     pts
+end
+
+"""
+    assigment_indices(X, Y, params; min_weight=0.2, max_outlier=0.5, mutual=true)
+
+Return a source-to-destination assignment vector of length N:
+- assign[i] = j (1..M) if source i is matched to destination j
+- assign[i] = 0 if unmatched (assigned to dummy column)
+
+Arguments:
+- X, Y: point sets (N×2, M×2)
+- params: result from `tps_rpm` (must contain `A`, `p_src_out`, `p_dst_out`)
+- min_weight: minimum row mass on best destination to accept a match
+        It require the best column for a source to carry enough mass.
+- max_outlier: max allowed outlier probability for source i and destination j
+        It rejects sources/destinations whose probability goes mostly to the outlier.
+- mutual: if true, require mutual best (i is the argmax in column j)
+        It enforces a simple 1–1 (mutual best) filter.
+"""
+function assigment_indices(X::AbstractMatrix, Y::AbstractMatrix, params;
+                             min_weight::Float64=0.2,
+                             max_outlier::Float64=0.5,
+                             mutual::Bool=true)
+    A = params.A
+    N, M = size(X, 1), size(Y, 1)
+    @assert size(A,1) == N+1 && size(A,2) == M+1 "A must be (N+1)×(M+1)"
+
+    Areal      = @view A[1:N, 1:M]
+    p_src_out  = params.p_src_out  # length N
+    p_dst_out  = params.p_dst_out  # length M
+
+    # Column-best indices (for mutual check)
+    col_best = Vector{Int}(undef, M)
+    @inbounds for j in 1:M
+        _, ib = findmax(@view Areal[:, j])
+        col_best[j] = ib
+    end
+
+    assign = fill(0, N)  # 0 = dummy (no assignment)
+
+    # Row-wise best with gating
+    @inbounds for i in 1:N
+        # If source mostly outlier → unmatched
+        if p_src_out[i] > max_outlier
+            assign[i] = 0
+            continue
+        end
+        w, j = findmax(@view Areal[i, :])  # best destination for source i
+        good = (w >= min_weight) &&
+               (p_dst_out[j] <= max_outlier) &&
+               (!mutual || col_best[j] == i)
+        assign[i] = good ? j : 0
+    end
+
+    return assign
+end
+
+function visualize_result(sz, X,Y, params; min_weight=0.0, max_outlier=10000.0, mutual=true, gridstep=15)
+    grid = make_grid_points(X, sz; gridstep=gridstep);
+    grid_warped = TPSRPM.tps_rpm_apply(X, params, grid)
+    
+    src_grid = show_pos(sz, grid)
+    dst_grid = show_pos(sz, grid_warped, 2)
+
+    idxY = assigment_indices(X, Y, params; min_weight=min_weight, max_outlier=max_outlier, mutual=mutual)
+    X_warped = tps_rpm_apply(X, params, X)
+
+    toassign = show_pos(sz, X, idxY)
+    assigned = show_pos(sz, X_warped, idxY)
+    dst_idx = zeros(Int64, size(Y,1)) .- 1
+    dst_idx[idxY[idxY.>0]] = idxY[idxY.>0];
+    reference = show_pos(sz, Y, dst_idx)
+
+    res = cat(src_grid, dst_grid, toassign, assigned, reference, dims=4)
+
+    res
 end
 
 end # module
