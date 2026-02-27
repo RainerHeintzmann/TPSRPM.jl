@@ -146,21 +146,27 @@ function soft_assign_bidir(X::AbstractMatrix, Y::AbstractMatrix;
     A = exp.(-beta .* D)
 
     # Sinkhorn-like normalization with outlier row/column
+    # We normalize only the real correspondence block A[1:N, 1:M]
+    # Outlier row/column participate but maintain fixed relative weights
     for _ in 1:5
-        # Row normalize (all real source rows including src-outlier col)
-        rowsum = sum(A, dims=2)
+        # Row normalize: rows 1:N over destinations 1:M only (exclude outlier column from sum)
         @inbounds for i in 1:N
-            s = rowsum[i]; s == 0 && continue
-            A[i, :] ./= s
+            s = sum(@view A[i, 1:M])
+            s == 0 && continue
+            # Scale real destinations; outlier column keeps its relative proportion
+            outlier_val = A[i, M+1]
+            A[i, 1:M] ./= (s + outlier_val)
+            A[i, M+1] = outlier_val / (s + outlier_val)
         end
-        # Column normalize (all real dest cols including dst-outlier row)
-        colsum = sum(A, dims=1)
+        # Column normalize: cols 1:M over sources 1:N only (exclude outlier row from sum)
         @inbounds for j in 1:M
-            s = colsum[j]; s == 0 && continue
-            A[:, j] ./= s
+            s = sum(@view A[1:N, j])
+            s == 0 && continue
+            # Scale real sources; outlier row keeps its relative proportion
+            outlier_val = A[N+1, j]
+            A[1:N, j] ./= (s + outlier_val)
+            A[N+1, j] = outlier_val / (s + outlier_val)
         end
-        # Optional: normalize the outlier row/col lightly to keep scales sane
-        # (leave A[N+1, :] and A[:, M+1] unnormalized or clamp if needed)
     end
 
     return A, @view(A[1:N, 1:M]), @view(A[1:N, M+1]), @view(A[N+1, 1:M])
@@ -380,7 +386,16 @@ function show_pos(sz, posmat, idxpos=1)
 end
 
 
-"Apply final warp to arbitrary points Q"
+"""
+    tps_rpm_apply(X::AbstractMatrix, params::NamedTuple, Q::AbstractMatrix)
+
+Apply final warp to arbitrary points Q
+
+# Parameters
+* `X`: source coordinates of the warp
+* param: defines the thin plate spline in detail
+* `Q`: The positions to apply the warp to
+"""
 function tps_rpm_apply(X::AbstractMatrix, params::NamedTuple, Q::AbstractMatrix)
     _tps_apply(X, params.wx, params.wy, params.ax, params.ay, Q)
 end
