@@ -2,7 +2,7 @@ module TPSRPM # Thin Plate Splin Robust Point Matching
 
 using LinearAlgebra, Statistics
 export vc2mat, tps_rpm_apply, tps_rpm, show_pos, make_grid_points, assigment_indices, visualize_result
-export get_affine_part, get_hard_assignment, affine_from_correspondences, get_affine_part_refined
+export get_affine_part, get_hard_assignment, affine_from_correspondences, rigid_from_correspondences, get_affine_part_refined
 
 """
     vc2mat(vec::AbstractVector) -> Matrix{Float64}
@@ -250,9 +250,19 @@ function get_affine_part(params; verbose=false)
               params.ay[2] params.ay[3]]
 
     # Translation: t = σX * a_s - A * μX + μY
+    # If refinement was done, use matched centroids for correct result
     σX = haskey(params, :σX) ? params.σX : 1.0
-    μX = haskey(params, :μX) ? params.μX : zeros(2)
-    μY = haskey(params, :μY) ? params.μY : zeros(2)
+    
+    # Use matched centroids if available (from refinement), else full centroids
+    if haskey(params, :μX_matched)
+        μX = params.μX_matched
+        μY = params.μY_matched
+        use_matched = true
+    else
+        μX = haskey(params, :μX) ? params.μX : zeros(2)
+        μY = haskey(params, :μY) ? params.μY : zeros(2)
+        use_matched = false
+    end
     center = haskey(params, :center) ? params.center : false
     
     a_s = [params.ax[1], params.ay[1]]
@@ -261,8 +271,8 @@ function get_affine_part(params; verbose=false)
         println("  a_s (scaled translation) = ", a_s)
         println("  matrix = ", matrix)
         println("  σX = ", σX)
-        println("  μX = ", μX)
-        println("  μY = ", μY)
+        println("  μX = ", μX, use_matched ? " (matched)" : " (all)")
+        println("  μY = ", μY, use_matched ? " (matched)" : " (all)")
         println("  center = ", center)
         println("  A*μX = ", matrix * μX)
         println("  σX*a_s = ", σX .* a_s)
@@ -463,7 +473,91 @@ end
 
 
 """
-    get_affine_part_refined(params, src, dst; method=:greedy)
+    rigid_from_correspondences(src, dst, assign; scale=false) -> (matrix, trans, n_matched)
+
+Compute optimal rigid transformation (rotation + translation) using the Kabsch algorithm.
+Optionally allows uniform scaling.
+
+Finds R, t such that `dst[assign[i]] ≈ R * src[i] + t` for matched pairs,
+where R is a rotation matrix (orthogonal, det=1).
+
+# Arguments
+- `src::AbstractMatrix`: N×2 source point set
+- `dst::AbstractMatrix`: M×2 destination point set  
+- `assign::Vector{Int}`: assignment vector where `assign[i] = j` means src[i] ↔ dst[j]
+- `scale::Bool=false`: if true, allow uniform scaling (similarity transform)
+
+# Returns
+- `matrix`: 2×2 rotation matrix (or scaled rotation if scale=true)
+- `trans`: (tx, ty) translation tuple
+- `n_matched`: number of matched pairs used (must be ≥ 2)
+
+# Example
+```julia
+assign = [2, 0, 1, 3]  # src[1]↔dst[2], src[3]↔dst[1], src[4]↔dst[3]
+R, trans, n = rigid_from_correspondences(src, dst, assign; scale=false)
+# R is a 2×2 rotation matrix
+```
+"""
+function rigid_from_correspondences(src::AbstractMatrix, dst::AbstractMatrix, assign::Vector{Int}; 
+                                    scale::Bool=false)
+    # Extract matched pairs
+    matched_idx = findall(a -> a > 0, assign)
+    n_matched = length(matched_idx)
+    
+    if n_matched < 2
+        error("Need at least 2 matched pairs for rigid estimation, got $n_matched")
+    end
+    
+    # Build matched source and destination point sets
+    src_m = src[matched_idx, :]           # N_matched × 2
+    dst_m = dst[assign[matched_idx], :]   # N_matched × 2
+    
+    # Compute centroids
+    μ_src = vec(mean(src_m, dims=1))
+    μ_dst = vec(mean(dst_m, dims=1))
+    
+    # Center the points
+    src_c = src_m .- μ_src'
+    dst_c = dst_m .- μ_dst'
+    
+    # Kabsch algorithm: find optimal rotation via SVD
+    # Cross-covariance matrix H = src_c' * dst_c (2×2 for 2D points)
+    H = src_c' * dst_c
+    
+    # SVD: H = U Σ V'
+    F = svd(H)
+    
+    # Optimal rotation: R = V * U'
+    R = F.V * F.U'
+    
+    # Handle reflection: ensure det(R) = +1
+    if det(R) < 0
+        # Flip sign of last column of V
+        V_corrected = copy(F.V)
+        V_corrected[:, end] *= -1
+        R = V_corrected * F.U'
+    end
+    
+    # Optional uniform scaling (similarity transform)
+    if scale
+        # Scale factor: s = trace(R' * H) / ||src_c||² = trace(Σ) / ||src_c||²
+        var_src = sum(src_c .^ 2)
+        if var_src > eps()
+            s = sum(F.S) / var_src
+            R = s * R
+        end
+    end
+    
+    # Translation: t = μ_dst - R * μ_src
+    t = μ_dst - R * μ_src
+    
+    return R, (t[1], t[2]), n_matched
+end
+
+
+"""
+    get_affine_part_refined(params, src, dst; method=:greedy, transform=:affine)
 
 Extract hard 1-to-1 correspondences from the soft assignment matrix and 
 recompute the affine transformation using direct least-squares.
@@ -477,6 +571,8 @@ Arguments:
 - `src`: Source point set (the first argument to `tps_rpm`)  
 - `dst`: Destination point set (the second argument to `tps_rpm`)
 - `method`: Assignment method (:greedy or :hungarian)
+- `transform`: Transform type (:affine or :rigid)
+- `scale`: For rigid transform, allow uniform scaling (default false)
 - `min_weight`: minimum assignment weight to accept (default 0.0)
 - `max_outlier`: maximum outlier probability (default 1.0 = no filtering)
 - `mutual`: if true, only keep mutual best matches
@@ -498,15 +594,21 @@ function get_affine_part_refined(params, src::AbstractMatrix, dst::AbstractMatri
                                   method::Symbol=:greedy,
                                   min_weight::Float64=0.0,
                                   max_outlier::Float64=1.0,
-                                  mutual::Bool=false)
+                                  mutual::Bool=false,
+                                  transform::Symbol=:affine,
+                                  scale::Bool=false)
     # Get hard assignment from soft matrix
     assign = get_hard_assignment(params; method=method, 
                                  min_weight=min_weight,
                                  max_outlier=max_outlier,
                                  mutual=mutual)
     
-    # Compute affine from matched correspondences
-    matrix, trans, n_matched = affine_from_correspondences(src, dst, assign)
+    # Compute transform from matched correspondences
+    if transform == :rigid
+        matrix, trans, n_matched = rigid_from_correspondences(src, dst, assign; scale=scale)
+    else
+        matrix, trans, n_matched = affine_from_correspondences(src, dst, assign)
+    end
     
     return matrix, trans, assign, n_matched
 end
@@ -567,7 +669,8 @@ end
 # --- TPS-RPM main loop ---
 """
     tps_rpm(X, Y; beta_sched, cout, λ, iters_per_beta, verbose, center, init, 
-            refine_affine, refine_min_weight, refine_max_outlier, refine_mutual) -> NamedTuple
+            refine_affine, refine_method, refine_min_weight, refine_max_outlier, 
+            refine_max_dist, refine_mutual, refine_iters) -> NamedTuple
 
 Compute thin-plate-spline (TPS) robust point matching (RPM) between source points X
 and destination points Y, allowing for outliers on both sides.
@@ -585,9 +688,16 @@ and destination points Y, allowing for outliers on both sides.
 - `center::Bool=false`: subtract centroids before optimization (translation-invariant)
 - `init::Symbol=:nothing`: initialization (`:centroid`, `:auto`, `:nothing`)
 - `refine_affine::Bool=false`: recompute affine from hard assignment after EM
-- `refine_min_weight::Float64=0.0`: min assignment weight for refinement (0-1)
-- `refine_max_outlier::Float64=1.0`: max outlier probability for refinement (0-1)
+- `refine_method::Symbol=:rigid`: method for affine refinement
+  - `:rigid` - Kabsch algorithm (rotation + translation only, no shear/scale)
+  - `:rigid_scale` - Kabsch with uniform scaling (similarity transform)
+  - `:affine` - general affine (allows shear and non-uniform scale)
+- `refine_min_weight::Float64=0.0`: min assignment weight for refinement (0-1). E.g. refine_min_weight=0.1 rejects low-confidence matches
+- `refine_max_outlier::Float64=1.0`: max outlier probability for refinement (0-1). E.g. refine_max_outlier=0.5 rejects point assigned mostrly to outliers
+- `refine_max_dist::Float64=Inf`: max distance (in original pixels) after initial warp to accept match.
+                                However, this distance has to be used with care, as it compares the distance to the destination coordinates with the outliers included, which means the threshold needs to be fairly large.
 - `refine_mutual::Bool=false`: require mutual best match for refinement
+- `refine_iters::Int=1`: number of refinement iterations (each re-filters by distance and re-solves)
 
 # Returns
 NamedTuple with fields:
@@ -610,8 +720,9 @@ R = [cos(θ) -sin(θ); sin(θ) cos(θ)]
 t = [10.0, -5.0]
 Y = (R * X')' .+ t'
 
-# Run TPS-RPM
-params = tps_rpm(X, Y; λ=1e4, refine_affine=true, verbose=true)
+# Run TPS-RPM with rigid refinement
+params = tps_rpm(X, Y; λ=1e4, refine_affine=true, refine_method=:rigid, 
+                 refine_max_dist=5.0, refine_iters=2, verbose=true)
 
 # Get assignment and affine transform
 assign = assigment_indices(X, Y, params)
@@ -628,9 +739,12 @@ function tps_rpm(X::AbstractMatrix, Y::AbstractMatrix; beta_sched=collect(0.5:0.
                  cout_src=nothing, cout_dst=nothing,
                  center::Bool=false, init::Symbol=:nothing,
                  refine_affine::Bool=false,
+                 refine_method::Symbol=:rigid,
                  refine_min_weight::Float64=0.0,
                  refine_max_outlier::Float64=1.0,
-                 refine_mutual::Bool=false)
+                 refine_max_dist::Float64=Inf,
+                 refine_mutual::Bool=false,
+                 refine_iters::Int=1)
 
     # Separate penalties (defaults to cout)
     cout_src_val = cout_src === nothing ? cout : cout_src
@@ -742,41 +856,84 @@ function tps_rpm(X::AbstractMatrix, Y::AbstractMatrix; beta_sched=collect(0.5:0.
 
     # Optional: refine affine using hard assignment and recompute TPS
     if refine_affine
-        # Get filtered hard 1-to-1 assignment from soft matrix
-        hard_assign = _filtered_greedy_assignment(Areal, p_src_out, p_dst_out;
-                                                   min_weight=refine_min_weight,
-                                                   max_outlier=refine_max_outlier,
-                                                   mutual=refine_mutual)
-        n_matched = count(>(0), hard_assign)
+        # Convert refine_max_dist to scaled coordinates
+        max_dist_scaled = refine_max_dist / σX
         
-        if n_matched >= 3
-            if verbose
-                println("Refining affine with $n_matched hard-matched pairs (filtered from $(N) sources)...")
+        for refine_iter in 1:refine_iters
+            # Get filtered hard 1-to-1 assignment from soft matrix
+            hard_assign = _filtered_greedy_assignment(Areal, p_src_out, p_dst_out;
+                                                       min_weight=refine_min_weight,
+                                                       max_outlier=refine_max_outlier,
+                                                       mutual=refine_mutual)
+            
+            # Additional filtering by distance (after current warp)
+            if isfinite(max_dist_scaled)
+                Xw_current = _tps_apply(Xs, wx, wy, ax, ay, Xs)
+                for i in 1:N
+                    j = hard_assign[i]
+                    if j > 0
+                        dx = Xw_current[i, 1] - Ys[j, 1]
+                        dy = Xw_current[i, 2] - Ys[j, 2]
+                        dist = sqrt(dx*dx + dy*dy)
+                        if dist > max_dist_scaled
+                            hard_assign[i] = 0  # Reject this match
+                        end
+                    end
+                end
+                if verbose
+                println("max_dist refinement leaves $(count(>(0), hard_assign)) matches")                    
+                end
             end
             
-            # Extract matched pairs in scaled coordinates
+            n_matched = count(>(0), hard_assign)
+            min_matches = refine_method == :affine ? 3 : 2
+            if n_matched < min_matches
+                if verbose
+                    println("Refinement iter $refine_iter: Only $n_matched matched pairs, need ≥$min_matches. Skipping.")
+                end
+                break
+            end
+            
+            if verbose
+                method_name = refine_method == :rigid ? "rigid (Kabsch)" : 
+                              refine_method == :rigid_scale ? "rigid+scale (Kabsch)" : "affine"
+                println("Refinement iter $refine_iter/$refine_iters: $n_matched pairs, method=$method_name")
+            end
+            
+            # Extract matched points for centroid computation
             matched_idx = findall(>(0), hard_assign)
-            src_matched = Xs[matched_idx, :]           # source points
-            dst_matched = Ys[hard_assign[matched_idx], :]  # corresponding destinations
+            src_matched = Xs[matched_idx, :]
+            dst_matched = Ys[hard_assign[matched_idx], :]
             
-            # Compute optimal affine in scaled coordinates: dst ≈ A * src + t
-            μ_src = vec(mean(src_matched, dims=1))
-            μ_dst = vec(mean(dst_matched, dims=1))
-            src_c = src_matched .- μ_src'
-            dst_c = dst_matched .- μ_dst'
+            # Store matched centroids (in scaled coordinates)
+            μX_matched_scaled = vec(mean(src_matched, dims=1))
+            μY_matched_scaled = vec(mean(dst_matched, dims=1))
             
-            # Solve: dst_c ≈ src_c * A'  =>  A' = (src_c' * src_c) \ (src_c' * dst_c)
-            StS = src_c' * src_c
-            StD = src_c' * dst_c
-            A_refined = (StS \ StD)'  # 2×2 matrix
-            t_refined = μ_dst - A_refined * μ_src  # 2-vector
+            # Compute transform based on method
+            if refine_method == :rigid || refine_method == :rigid_scale
+                # Use Kabsch algorithm for rigid/similarity transform
+                allow_scale = (refine_method == :rigid_scale)
+                A_refined, t_tuple, _ = rigid_from_correspondences(Xs, Ys, hard_assign; scale=allow_scale)
+                t_refined = [t_tuple[1], t_tuple[2]]
+            else
+                # General affine (original least-squares method)
+                μ_src = μX_matched_scaled
+                μ_dst = vec(mean(dst_matched, dims=1))
+                src_c = src_matched .- μ_src'
+                dst_c = dst_matched .- μ_dst'
+                
+                StS = src_c' * src_c
+                StD = src_c' * dst_c
+                A_refined = (StS \ StD)'
+                t_refined = μ_dst - A_refined * μ_src
+            end
             
             # Update affine coefficients: [a0, a1, a2] for each dimension
             ax = [t_refined[1], A_refined[1,1], A_refined[1,2]]
             ay = [t_refined[2], A_refined[2,1], A_refined[2,2]]
             
             # Recompute TPS warping coefficients with fixed refined affine
-            # Use weighted targets from soft assignment (as before)
+            # Use weighted targets from soft assignment
             rowmass = sum(Areal, dims=2)
             EY = similar(Xs, (N,2))
             @inbounds for i in 1:N
@@ -795,14 +952,10 @@ function tps_rpm(X::AbstractMatrix, Y::AbstractMatrix; beta_sched=collect(0.5:0.
             
             # Solve for warping coefficients with fixed affine
             wx, wy = _tps_solve_fixed_affine(Xs, EY, ax, ay; λ=λ)
-            
-            if verbose
-                println("Affine refinement complete.")
-            end
-        else
-            if verbose
-                println("Warning: Only $n_matched matched pairs, need ≥3 for affine refinement. Skipping.")
-            end
+        end
+        
+        if verbose
+            println("Affine refinement complete.")
         end
     end
     
@@ -810,8 +963,18 @@ function tps_rpm(X::AbstractMatrix, Y::AbstractMatrix; beta_sched=collect(0.5:0.
     # f_orig(p) = a0' + A p + Σ w U(||p - X_j||), with a0' = a0 - A μX + μY
     # Store scaled control points and coordinate transform info for tps_rpm_apply
     # Parameters (wx, wy, ax, ay) stay in scaled space; tps_rpm_apply handles conversion
-    return (; wx, wy, ax, ay, A, Areal, p_src_out, p_dst_out, diag, 
-            Xctl=Xs, μX, μY, σX, center)
+    
+    # If refinement was done, store matched centroids for correct affine extraction
+    if refine_affine && @isdefined(μX_matched_scaled) && @isdefined(μY_matched_scaled)
+        # Convert matched centroids back to original coordinates
+        μX_matched = σX .* μX_matched_scaled .+ μX
+        μY_matched = σX .* μY_matched_scaled .+ μY
+        return (; wx, wy, ax, ay, A, Areal, p_src_out, p_dst_out, diag, 
+                Xctl=Xs, μX, μY, σX, center, μX_matched, μY_matched)
+    else
+        return (; wx, wy, ax, ay, A, Areal, p_src_out, p_dst_out, diag, 
+                Xctl=Xs, μX, μY, σX, center)
+    end
 end
 
 

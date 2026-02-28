@@ -40,10 +40,12 @@ E = 0 # 1 .*(rand(100,2) .- 0.5);
 
 Y = (rotM * (X' .+ transl))' .+ E;
 
-# Test with NEW refine_affine option
-params = tps_rpm(Y, X; beta_sched=collect(0.5:0.5:100.0), cout=1.0, λ=100000.0, iters_per_beta=3, center=true, verbose=false, refine_affine=true);
+# Test with NEW refine_affine option using Kabsch algorithm
+params = tps_rpm(Y, X; beta_sched=collect(0.5:0.5:100.0), cout=1.0, λ=100000.0, 
+        iters_per_beta=3, center=true, verbose=false, 
+        refine_affine=true, refine_method=:rigid, refine_max_dist=5.0, refine_iters=2);
 
-println("=== With refine_affine=true ===")
+println("=== With refine_affine=true, refine_method=:rigid ===")
 found_mat, found_trans = get_affine_part(params; verbose=true)
 
 # NEW: Refined affine from hard assignment
