@@ -1,12 +1,26 @@
 module TPSRPM # Thin Plate Splin Robust Point Matching
 
 using LinearAlgebra, Statistics
-export vc2mat, tps_rpm_apply, tps_rpm, show_pos, make_grid_points, infer_order, assigment_indices, visualize_result
+export vc2mat, tps_rpm_apply, tps_rpm, show_pos, make_grid_points, assigment_indices, visualize_result
+export get_affine_part, get_hard_assignment, affine_from_correspondences, get_affine_part_refined
 
 """
-    vc2mat(vec)
+    vc2mat(vec::AbstractVector) -> Matrix{Float64}
 
-converts a vector of cartesian indices (as obtained by findmaxima) into a matrix (as using in inputs of the TPSRPM algorithm).
+Convert a vector of tuples or CartesianIndices to an N×2 matrix for use with TPSRPM.
+
+# Arguments
+- `vec`: Vector of tuples or CartesianIndices (as obtained from `findlocalmaxima` etc.)
+
+# Returns
+- `Matrix{Float64}`: N×2 matrix where each row is [x, y] coordinates
+
+# Example
+```julia
+positions = [(10.0, 20.0), (30.0, 40.0), (50.0, 60.0)]
+X = vc2mat(positions)
+# X is now a 3×2 matrix
+```
 """
 function vc2mat(vec)
     res = zeros(length(vec), 2)
@@ -37,7 +51,7 @@ function _pairwise_U(P::AbstractMatrix{Float64})
 end
 
 function _tps_solve(P::AbstractMatrix{Float64}, Y::AbstractMatrix{Float64}; λ=1e-3)
-    # P: N×2, Y: N×2 expected targets (possibly fractional from soft assignments)
+    # P: N×2 control points, Y: N×2 expected targets
     N = size(P,1)
     K = _pairwise_U(P)           # N×N
     Pm = [ones(N) P]             # N×3
@@ -45,9 +59,37 @@ function _tps_solve(P::AbstractMatrix{Float64}, Y::AbstractMatrix{Float64}; λ=1
     # Solve independently for x and y outputs
     cx = A \ vcat(Y[:,1], zeros(3))
     cy = A \ vcat(Y[:,2], zeros(3))
-    wx = view(cx, 1:N); ax = @view cx[N+1:end]  # [a0, ax, ay]
-    wy = view(cy, 1:N); ay = @view cy[N+1:end]
+    wx = cx[1:N]; ax = cx[N+1:end]  # [a0, ax, ay]
+    wy = cy[1:N]; ay = cy[N+1:end]
     return wx, wy, ax, ay
+end
+
+# Solve TPS with fixed affine part - only find warping coefficients wx, wy
+# Given: f(p) = a0 + A*p + Σ w_j U(||p - P_j||)
+# With affine [a0, a1, a2] fixed, solve (K + λI) w = Y - P_affine * a
+function _tps_solve_fixed_affine(P::AbstractMatrix{Float64}, Y::AbstractMatrix{Float64}, 
+                                  ax::AbstractVector{Float64}, ay::AbstractVector{Float64}; λ=1e-3)
+    N = size(P,1)
+    K = _pairwise_U(P)           # N×N
+    Pm = [ones(N) P]             # N×3 - design matrix for affine
+    
+    # Compute affine contribution at control points
+    affine_x = Pm * ax  # N vector
+    affine_y = Pm * ay  # N vector
+    
+    # Residual targets after subtracting affine
+    residual_x = Y[:,1] .- affine_x
+    residual_y = Y[:,2] .- affine_y
+    
+    # Solve (K + λI) w = residual
+    # With constraint: P' * w = 0 (for valid TPS)
+    # Use regularized solve: minimize ||w||² + λ⁻¹||(K+λI)w - residual||²
+    # Simpler: directly solve with regularization
+    KλI = K + λ * I
+    wx = KλI \ residual_x
+    wy = KλI \ residual_y
+    
+    return wx, wy
 end
 
 function _tps_apply(P::AbstractMatrix{Float64}, wx::AbstractVector{Float64}, wy::AbstractVector{Float64}, ax::AbstractVector{Float64}, ay::AbstractVector{Float64}, Q::AbstractMatrix{Float64})
@@ -135,10 +177,24 @@ function soft_assign_bidir(X::AbstractMatrix, Y::AbstractMatrix;
             dx = xi - Y[j,1]; dy = yi - Y[j,2]
             D[i,j] = dx*dx + dy*dy
         end
-        D[i,M+1] = cout_src         # source outlier
+    end
+    
+    # Only scale distances if there's risk of numerical underflow
+    # exp(-700) ≈ 0 (underflow threshold)
+    Dreal = @view D[1:N, 1:M]
+    max_dist = maximum(Dreal)
+    scale_factor = 1.0
+    if beta * max_dist > 500  # conservative threshold
+        scale_factor = 500 / (beta * max_dist)
+        Dreal .*= scale_factor
+    end
+    
+    # Set outlier costs (scaled consistently if distances were scaled)
+    for i in 1:N
+        D[i,M+1] = cout_src * scale_factor
     end
     for j in 1:M
-        D[N+1,j] = cout_dst         # destination outlier
+        D[N+1,j] = cout_dst * scale_factor
     end
     D[N+1,M+1] = 0.0                # outlier↔outlier (unused but finite)
 
@@ -146,31 +202,315 @@ function soft_assign_bidir(X::AbstractMatrix, Y::AbstractMatrix;
     A = exp.(-beta .* D)
 
     # Sinkhorn-like normalization with outlier row/column
-    # We normalize only the real correspondence block A[1:N, 1:M]
-    # Outlier row/column participate but maintain fixed relative weights
     for _ in 1:5
-        # Row normalize: rows 1:N over destinations 1:M only (exclude outlier column from sum)
+        # Row normalize (all real source rows including src-outlier col)
+        rowsum = sum(A, dims=2)
         @inbounds for i in 1:N
-            s = sum(@view A[i, 1:M])
-            s == 0 && continue
-            # Scale real destinations; outlier column keeps its relative proportion
-            outlier_val = A[i, M+1]
-            A[i, 1:M] ./= (s + outlier_val)
-            A[i, M+1] = outlier_val / (s + outlier_val)
+            s = rowsum[i]; s == 0 && continue
+            A[i, :] ./= s
         end
-        # Column normalize: cols 1:M over sources 1:N only (exclude outlier row from sum)
+        # Column normalize (all real dest cols including dst-outlier row)
+        colsum = sum(A, dims=1)
         @inbounds for j in 1:M
-            s = sum(@view A[1:N, j])
-            s == 0 && continue
-            # Scale real sources; outlier row keeps its relative proportion
-            outlier_val = A[N+1, j]
-            A[1:N, j] ./= (s + outlier_val)
-            A[N+1, j] = outlier_val / (s + outlier_val)
+            s = colsum[j]; s == 0 && continue
+            A[:, j] ./= s
         end
+        # Optional: normalize the outlier row/col lightly to keep scales sane
+        # (leave A[N+1, :] and A[:, M+1] unnormalized or clamp if needed)
     end
 
     return A, @view(A[1:N, 1:M]), @view(A[1:N, M+1]), @view(A[N+1, 1:M])
 end
+
+
+"""
+    get_affine_part(params; verbose=false) -> (matrix, trans)
+
+Extract the affine transformation (2×2 matrix + translation) from TPS-RPM results.
+The parameters are transformed from scaled/centered space back to original coordinates.
+
+# Arguments
+- `params`: NamedTuple result from `tps_rpm`
+- `verbose::Bool=false`: if true, print debugging information
+
+# Returns
+- `matrix`: 2×2 linear transformation matrix
+- `trans`: (tx, ty) translation tuple
+
+# Example
+```julia
+params = tps_rpm(X, Y; λ=1.0)
+matrix, trans = get_affine_part(params)
+# Apply: Y_approx = matrix * X[i,:] + [trans[1], trans[2]]
+```
+"""
+function get_affine_part(params; verbose=false)
+    # Linear part (2x2 matrix) - same in both coordinate systems
+    matrix = [params.ax[2] params.ax[3];
+              params.ay[2] params.ay[3]]
+
+    # Translation: t = σX * a_s - A * μX + μY
+    σX = haskey(params, :σX) ? params.σX : 1.0
+    μX = haskey(params, :μX) ? params.μX : zeros(2)
+    μY = haskey(params, :μY) ? params.μY : zeros(2)
+    center = haskey(params, :center) ? params.center : false
+    
+    a_s = [params.ax[1], params.ay[1]]
+    if verbose
+        println("get_affine_part debug:")
+        println("  a_s (scaled translation) = ", a_s)
+        println("  matrix = ", matrix)
+        println("  σX = ", σX)
+        println("  μX = ", μX)
+        println("  μY = ", μY)
+        println("  center = ", center)
+        println("  A*μX = ", matrix * μX)
+        println("  σX*a_s = ", σX .* a_s)
+        println("  σX*a_s - A*μX = ", σX .* a_s .- matrix * μX)
+    end
+    if center || haskey(params, :σX)
+        trans_vec = σX .* a_s .- matrix * μX .+ μY
+        trans = (trans_vec[1], trans_vec[2])
+    else
+        trans = (params.ax[1], params.ay[1])
+    end
+
+    return matrix, trans
+end
+
+
+"""
+    get_hard_assignment(params; method=:greedy, min_weight=0.0, max_outlier=1.0, mutual=false) -> Vector{Int}
+
+Extract 1-to-1 hard assignment from the soft assignment matrix.
+
+# Arguments
+- `params`: NamedTuple result from `tps_rpm` (must contain `A`)
+- `method::Symbol=:greedy`: assignment algorithm
+  - `:greedy` - Iteratively pick best remaining match (fast, not globally optimal)
+  - `:hungarian` - True Hungarian algorithm (not yet implemented)
+- `min_weight::Float64=0.0`: minimum assignment weight to accept
+- `max_outlier::Float64=1.0`: maximum outlier probability (1.0 = no filtering)
+- `mutual::Bool=false`: if true, only keep mutual best matches
+
+# Returns
+- `assign::Vector{Int}`: length N, where `assign[i] = j` means source i matches dest j,
+  `assign[i] = 0` means unmatched
+
+# Example
+```julia
+params = tps_rpm(X, Y; λ=1.0)
+assign = get_hard_assignment(params; min_weight=0.1, mutual=true)
+matched = findall(>(0), assign)  # indices of matched sources
+```
+"""
+function get_hard_assignment(params; method::Symbol=:greedy,
+                             min_weight::Float64=0.0,
+                             max_outlier::Float64=1.0,
+                             mutual::Bool=false)
+    A = params.A
+    N = size(A, 1) - 1  # Exclude outlier row
+    M = size(A, 2) - 1  # Exclude outlier column
+    
+    Areal = @view A[1:N, 1:M]
+    p_src_out = @view A[1:N, M+1]
+    p_dst_out = @view A[N+1, 1:M]
+    
+    if method == :greedy
+        if min_weight > 0.0 || max_outlier < 1.0 || mutual
+            return _filtered_greedy_assignment(Areal, p_src_out, p_dst_out;
+                                               min_weight=min_weight,
+                                               max_outlier=max_outlier,
+                                               mutual=mutual)
+        else
+            return _greedy_assignment(Areal)
+        end
+    elseif method == :hungarian
+        error("Hungarian method not yet implemented. Use method=:greedy or install Hungarian.jl")
+    else
+        error("Unknown method: $method. Use :greedy or :hungarian")
+    end
+end
+
+# Greedy 1-to-1 assignment: iteratively pick the highest weight unassigned pair
+function _greedy_assignment(Areal::AbstractMatrix)
+    N, M = size(Areal)
+    assign = zeros(Int, N)
+    used_dst = falses(M)
+    
+    # Create list of all (i, j, weight) and sort by weight descending
+    pairs = [(i, j, Areal[i, j]) for i in 1:N for j in 1:M]
+    sort!(pairs, by=x -> -x[3])  # Sort by weight descending
+    
+    matched_sources = 0
+    for (i, j, w) in pairs
+        if assign[i] == 0 && !used_dst[j] && w > 0
+            assign[i] = j
+            used_dst[j] = true
+            matched_sources += 1
+            if matched_sources == min(N, M)
+                break  # All possible matches made
+            end
+        end
+    end
+    
+    return assign
+end
+
+# Filtered greedy assignment with min_weight, max_outlier, and mutual constraints
+function _filtered_greedy_assignment(Areal::AbstractMatrix, 
+                                      p_src_out::AbstractVector,
+                                      p_dst_out::AbstractVector;
+                                      min_weight::Float64=0.0,
+                                      max_outlier::Float64=1.0,
+                                      mutual::Bool=false)
+    N, M = size(Areal)
+    assign = zeros(Int, N)
+    used_dst = falses(M)
+    
+    # Precompute column-best indices for mutual check
+    col_best = Vector{Int}(undef, M)
+    @inbounds for j in 1:M
+        _, ib = findmax(@view Areal[:, j])
+        col_best[j] = ib
+    end
+    
+    # Create list of all (i, j, weight) and sort by weight descending
+    pairs = [(i, j, Areal[i, j]) for i in 1:N for j in 1:M]
+    sort!(pairs, by=x -> -x[3])  # Sort by weight descending
+    
+    matched_sources = 0
+    for (i, j, w) in pairs
+        if assign[i] == 0 && !used_dst[j]
+            # Apply filtering criteria
+            passes_weight = w >= min_weight
+            passes_src_outlier = p_src_out[i] <= max_outlier
+            passes_dst_outlier = p_dst_out[j] <= max_outlier
+            passes_mutual = !mutual || col_best[j] == i
+            
+            if passes_weight && passes_src_outlier && passes_dst_outlier && passes_mutual
+                assign[i] = j
+                used_dst[j] = true
+                matched_sources += 1
+                if matched_sources == min(N, M)
+                    break  # All possible matches made
+                end
+            end
+        end
+    end
+    
+    return assign
+end
+
+
+"""
+    affine_from_correspondences(src, dst, assign) -> (matrix, trans, n_matched)
+
+Compute optimal affine transformation from point correspondences using least-squares.
+
+Finds A, t such that `dst[assign[i]] ≈ A * src[i] + t` for matched pairs.
+
+# Arguments
+- `src::AbstractMatrix`: N×2 source point set
+- `dst::AbstractMatrix`: M×2 destination point set  
+- `assign::Vector{Int}`: assignment vector where `assign[i] = j` means src[i] ↔ dst[j]
+
+# Returns
+- `matrix`: 2×2 linear transformation matrix (maps src → dst)
+- `trans`: (tx, ty) translation tuple
+- `n_matched`: number of matched pairs used (must be ≥ 3)
+
+# Example
+```julia
+assign = [2, 0, 1, 3]  # src[1]↔dst[2], src[3]↔dst[1], src[4]↔dst[3]
+matrix, trans, n = affine_from_correspondences(src, dst, assign)
+# n = 3 (three matched pairs)
+```
+"""
+function affine_from_correspondences(src::AbstractMatrix, dst::AbstractMatrix, assign::Vector{Int})
+    # Extract matched pairs
+    matched_idx = findall(a -> a > 0, assign)
+    n_matched = length(matched_idx)
+    
+    if n_matched < 3
+        error("Need at least 3 matched pairs for affine estimation, got $n_matched")
+    end
+    
+    # Build matched source and destination point sets
+    src_m = src[matched_idx, :]           # N_matched × 2 (source points)
+    dst_m = dst[assign[matched_idx], :]   # N_matched × 2 (corresponding destination points)
+    
+    # Compute centroids
+    μ_src = vec(mean(src_m, dims=1))
+    μ_dst = vec(mean(dst_m, dims=1))
+    
+    # Center the points
+    src_c = src_m .- μ_src'
+    dst_c = dst_m .- μ_dst'
+    
+    # Solve for A in: dst_c ≈ src_c * A'  (least squares, row form)
+    # This is equivalent to: dst = A * src (column form)
+    # Normal equations give: A' = (src_c' * src_c) \ (src_c' * dst_c)
+    StS = src_c' * src_c
+    StD = src_c' * dst_c
+    A = (StS \ StD)'
+    
+    # Translation: t = μ_dst - A * μ_src
+    t = μ_dst - A * μ_src
+    
+    return A, (t[1], t[2]), n_matched
+end
+
+
+"""
+    get_affine_part_refined(params, src, dst; method=:greedy)
+
+Extract hard 1-to-1 correspondences from the soft assignment matrix and 
+recompute the affine transformation using direct least-squares.
+
+This gives more accurate affine parameters than `get_affine_part` when the
+soft assignment is slightly diffuse (which happens with small rotations or
+nearby points).
+
+Arguments:
+- `params`: TPS-RPM result from `tps_rpm`
+- `src`: Source point set (the first argument to `tps_rpm`)  
+- `dst`: Destination point set (the second argument to `tps_rpm`)
+- `method`: Assignment method (:greedy or :hungarian)
+- `min_weight`: minimum assignment weight to accept (default 0.0)
+- `max_outlier`: maximum outlier probability (default 1.0 = no filtering)
+- `mutual`: if true, only keep mutual best matches
+
+Returns:
+- `matrix`: 2×2 affine matrix (maps src → dst)
+- `trans`: (tx, ty) translation (maps src → dst)
+- `assign`: hard assignment vector (assign[i] = j means src[i] matches dst[j])
+- `n_matched`: number of matched pairs
+
+Example:
+```julia
+params = tps_rpm(Y, X; ...)  # Y=source, X=destination
+matrix, trans, assign, n = get_affine_part_refined(params, Y, X)
+# Now: X[assign[i]] ≈ matrix * Y[i] + trans for matched pairs
+```
+"""
+function get_affine_part_refined(params, src::AbstractMatrix, dst::AbstractMatrix; 
+                                  method::Symbol=:greedy,
+                                  min_weight::Float64=0.0,
+                                  max_outlier::Float64=1.0,
+                                  mutual::Bool=false)
+    # Get hard assignment from soft matrix
+    assign = get_hard_assignment(params; method=method, 
+                                 min_weight=min_weight,
+                                 max_outlier=max_outlier,
+                                 mutual=mutual)
+    
+    # Compute affine from matched correspondences
+    matrix, trans, n_matched = affine_from_correspondences(src, dst, assign)
+    
+    return matrix, trans, assign, n_matched
+end
+
 
 # --- diagnostics helpers ---
 
@@ -226,42 +566,71 @@ end
 
 # --- TPS-RPM main loop ---
 """
-    tps_rpm(X::AbstractMatrix, Y::AbstractMatrix;
-            beta_sched=collect(0.5:0.5:6.0),
-            cout=1.0, λ=1e-3, iters_per_beta::Int=3, verbose=false,
-            cout_src::Union{Nothing,Float64}=nothing,
-            cout_dst::Union{Nothing,Float64}=nothing,
-            center::Bool=true,
-            init::Symbol=:auto)
+    tps_rpm(X, Y; beta_sched, cout, λ, iters_per_beta, verbose, center, init, 
+            refine_affine, refine_min_weight, refine_max_outlier, refine_mutual) -> NamedTuple
 
-calculates an optimized thin-plate-spline (TPS) robust point matching (RPM) between the (non-moving) sources X[N×2] and the
-(moving) destination postions Y[M×2]. 
+Compute thin-plate-spline (TPS) robust point matching (RPM) between source points X
+and destination points Y, allowing for outliers on both sides.
 
-# Parameters
-- beta_sched: vector of β values (increasing, signifying the "inverse temperature"), e.g. 0.5:0.5:4.0
-The schedule of beta values to follow. The final beta determines how mucht the result corresponds to a permutation matrix.
-Anneal to very large β (i.e. a low temperature) to obtain a unique assiment.
+# Arguments
+- `X::AbstractMatrix`: N×2 source (non-moving) point set
+- `Y::AbstractMatrix`: M×2 destination (moving) point set
+- `beta_sched=collect(0.5:0.5:6.0)`: annealing schedule of inverse temperatures (increasing)
+- `cout::Float64=1.0`: outlier cost (used for both source and dest unless overridden)
+- `cout_src::Float64=nothing`: outlier cost for unmatched sources (defaults to `cout`)
+- `cout_dst::Float64=nothing`: outlier cost for unmatched destinations (defaults to `cout`)
+- `λ::Float64=20.0`: TPS bending regularization. Large (1e4) for affine, small (0.1-100) for warping
+- `iters_per_beta::Int=3`: EM iterations per β value
+- `verbose::Bool=false`: print energy decomposition per iteration
+- `center::Bool=false`: subtract centroids before optimization (translation-invariant)
+- `init::Symbol=:nothing`: initialization (`:centroid`, `:auto`, `:nothing`)
+- `refine_affine::Bool=false`: recompute affine from hard assignment after EM
+- `refine_min_weight::Float64=0.0`: min assignment weight for refinement (0-1)
+- `refine_max_outlier::Float64=1.0`: max outlier probability for refinement (0-1)
+- `refine_mutual::Bool=false`: require mutual best match for refinement
 
-- cout: outlier cost for dummy column (used for source and destination if provided)
-- cout_src: outlier cost for dummy column sources
-- cout_dst: outlier cost for dummy column destination
-- λ: TPS regularization
-- iters_per_beta: EM steps per β
-- center=true: subtract centroids of X and Y before optimization (translation-invariant path). The returned affine constants are mapped back to original coordinates.
-- init when center=false: 
-    if `init == :centroid`, initialize the affine translation to mean(Y)−mean(X).
-    `:auto` behaves like `:centroid` when center=false, otherwise identity.
-    `:nothing` means to not apply centering.
+# Returns
+NamedTuple with fields:
+- `wx, wy`: N-vectors of TPS warp coefficients
+- `ax, ay`: 3-vectors [a0, a1, a2] for affine: out = a0 + a1*x + a2*y
+- `A`: (N+1)×(M+1) soft assignment matrix (last row/col are outliers)
+- `Areal`: N×M view of real assignments (excludes outlier row/col)
+- `p_src_out, p_dst_out`: outlier probabilities
+- `diag`: vector of per-iteration diagnostics
+- `Xctl, μX, μY, σX, center`: coordinate transform info for `tps_rpm_apply`
 
-Note that this algorithm is asymmetric. The sources should normally be the smaller of the two points to match.
-The sources define the thin plate spline (TPS)
-Returns warp parameters (wx, wy, ax, ay), final soft matrix A, and diagnostics.
+# Example
+```julia
+using TPSRPM
 
+# Create test data: Y is rotated/translated version of X
+X = rand(20, 2) .* 100
+θ = deg2rad(5)  # 5° rotation
+R = [cos(θ) -sin(θ); sin(θ) cos(θ)]
+t = [10.0, -5.0]
+Y = (R * X')' .+ t'
+
+# Run TPS-RPM
+params = tps_rpm(X, Y; λ=1e4, refine_affine=true, verbose=true)
+
+# Get assignment and affine transform
+assign = assigment_indices(X, Y, params)
+matrix, trans = get_affine_part(params)
+
+# Apply warp to new points
+X_warped = tps_rpm_apply(X, params, X)
+```
+
+Note: Algorithm is asymmetric. Sources (X) define the TPS; typically use smaller set as source.
 """
 function tps_rpm(X::AbstractMatrix, Y::AbstractMatrix; beta_sched=collect(0.5:0.5:6.0),
-                 cout=1.0, λ=1e-3, iters_per_beta::Int=3, verbose=false,
+                 cout::Float64=1.0, λ::Float64=20.0, iters_per_beta::Int=3, verbose=false,
                  cout_src=nothing, cout_dst=nothing,
-                 center::Bool=false, init::Symbol=:nothing)
+                 center::Bool=false, init::Symbol=:nothing,
+                 refine_affine::Bool=false,
+                 refine_min_weight::Float64=0.0,
+                 refine_max_outlier::Float64=1.0,
+                 refine_mutual::Bool=false)
 
     # Separate penalties (defaults to cout)
     cout_src_val = cout_src === nothing ? cout : cout_src
@@ -273,14 +642,39 @@ function tps_rpm(X::AbstractMatrix, Y::AbstractMatrix; beta_sched=collect(0.5:0.
     Xc = center ? (X .- (μX')) : X
     Yc = center ? (Y .- (μY')) : Y
 
-    N, M = size(Xc,1), size(Yc,1)
+    # Scale coordinates to make λ interpretable (K values become O(1))
+    # Scale by characteristic spread of control points
+    σX = max(std(Xc[:,1]), std(Xc[:,2]), 1.0)
+    Xs = Xc ./ σX
+    Ys = Yc ./ σX  # Use same scale for both
+
+    N, M = size(Xs,1), size(Ys,1)
+
+    # Check for near-identity case (X ≈ Y with same size)
+    # Return identity transform directly to avoid numerical drift
+    if N == M && maximum(abs.(Xs .- Ys)) < 1e-10
+        wx = zeros(N); wy = zeros(N)
+        ax = [0.0, 1.0, 0.0]
+        ay = [0.0, 0.0, 1.0]
+        # Create identity matching matrix
+        A = zeros(N+1, M+1)
+        for i in 1:N
+            A[i, i] = 1.0
+        end
+        Areal = @view A[1:N, 1:M]
+        p_src_out = @view A[1:N, M+1]
+        p_dst_out = @view A[N+1, 1:M]
+        diag = Vector{NamedTuple}()
+        return (; wx, wy, ax, ay, A, Areal, p_src_out, p_dst_out, diag, 
+                Xctl=Xs, μX, μY, σX, center)
+    end
 
     # Initialize warp (affine can encode pure translation)
     wx = zeros(N); wy = zeros(N)
-    ax = [0.0, 1.0, 0.0]  # [a0x, axx, axy]
-    ay = [0.0, 0.0, 1.0]  # [a0y, ayx, ayy]
+    ax = [0.0, 1.0, 0.0]  # [a0x, axx, axy] in scaled coords
+    ay = [0.0, 0.0, 1.0]  # [a0y, ayx, ayy] in scaled coords
     if !center && (init == :centroid || init == :auto)
-        Δ = vec(mean(Y, dims=1) .- mean(X, dims=1))
+        Δ = vec(mean(Y, dims=1) .- mean(X, dims=1)) ./ σX
         ax[1] = Δ[1]; ay[1] = Δ[2]
     end
 
@@ -290,34 +684,34 @@ function tps_rpm(X::AbstractMatrix, Y::AbstractMatrix; beta_sched=collect(0.5:0.
     for (kβ, β) in pairs(beta_sched)
         for n in 1:iters_per_beta
             # E-step: warp X, then bidirectional soft assignment
-            Xw = _tps_apply(Xc, wx, wy, ax, ay, Xc)
-            Afull, Areal, p_src_out, p_dst_out = soft_assign_bidir(Xw, Yc; beta=β,
+            Xw = _tps_apply(Xs, wx, wy, ax, ay, Xs)
+            Afull, Areal, p_src_out, p_dst_out = soft_assign_bidir(Xw, Ys; beta=β,
                                                                    cout_src=cout_src_val,
                                                                    cout_dst=cout_dst_val)
 
             # Expected targets for each source (ignore source-outlier mass)
             rowmass = sum(Areal, dims=2)
-            EY = similar(Xc, (N,2))
+            EY = similar(Xs, (N,2))
             @inbounds for i in 1:N
                 m = rowmass[i]
                 if m <= eps()
-                    EY[i,1] = Xc[i,1]; EY[i,2] = Xc[i,2]
+                    EY[i,1] = Xs[i,1]; EY[i,2] = Xs[i,2]
                 else
                     s1 = 0.0; s2 = 0.0
                     @inbounds for j in 1:M
                         w = Areal[i,j]
-                        s1 += w * Yc[j,1]; s2 += w * Yc[j,2]
+                        s1 += w * Ys[j,1]; s2 += w * Ys[j,2]
                     end
                     EY[i,1] = s1 / m; EY[i,2] = s2 / m
                 end
             end
 
-            # M-step: fit TPS Xc -> EY
-            wx, wy, ax, ay = _tps_solve(Xc, EY; λ=λ)
+            # M-step: fit TPS Xs -> EY (in scaled coordinates)
+            wx, wy, ax, ay = _tps_solve(Xs, EY; λ=λ)
 
             # Diagnostics (energy decomposition)
-            Xw_new = _tps_apply(Xc, wx, wy, ax, ay, Xc)
-            comps = _energy_components(; X=Xc, Xw=Xw_new, Y=Yc, Afull=Afull, Areal=Areal,
+            Xw_new = _tps_apply(Xs, wx, wy, ax, ay, Xs)
+            comps = _energy_components(; X=Xs, Xw=Xw_new, Y=Ys, Afull=Afull, Areal=Areal,
                                         p_src_out=p_src_out, p_dst_out=p_dst_out,
                                         wx=wx, wy=wy, λ=λ, cout_src=cout_src_val, cout_dst=cout_dst_val)
             E_total = comps.E_data + comps.E_src_out + comps.E_dst_out + comps.E_bend_K + comps.E_bend_I
@@ -340,31 +734,107 @@ function tps_rpm(X::AbstractMatrix, Y::AbstractMatrix; beta_sched=collect(0.5:0.
         end
     end
 
-    # Final A at last β (centered frame)
-    Xw_last = _tps_apply(Xc, wx, wy, ax, ay, Xc)
-    A, Areal, p_src_out, p_dst_out = soft_assign_bidir(Xw_last, Yc;
+    # Final A at last β (scaled frame)
+    Xw_last = _tps_apply(Xs, wx, wy, ax, ay, Xs)
+    A, Areal, p_src_out, p_dst_out = soft_assign_bidir(Xw_last, Ys;
                                                        beta=last(beta_sched),
                                                        cout_src=cout_src_val, cout_dst=cout_dst_val)
 
+    # Optional: refine affine using hard assignment and recompute TPS
+    if refine_affine
+        # Get filtered hard 1-to-1 assignment from soft matrix
+        hard_assign = _filtered_greedy_assignment(Areal, p_src_out, p_dst_out;
+                                                   min_weight=refine_min_weight,
+                                                   max_outlier=refine_max_outlier,
+                                                   mutual=refine_mutual)
+        n_matched = count(>(0), hard_assign)
+        
+        if n_matched >= 3
+            if verbose
+                println("Refining affine with $n_matched hard-matched pairs (filtered from $(N) sources)...")
+            end
+            
+            # Extract matched pairs in scaled coordinates
+            matched_idx = findall(>(0), hard_assign)
+            src_matched = Xs[matched_idx, :]           # source points
+            dst_matched = Ys[hard_assign[matched_idx], :]  # corresponding destinations
+            
+            # Compute optimal affine in scaled coordinates: dst ≈ A * src + t
+            μ_src = vec(mean(src_matched, dims=1))
+            μ_dst = vec(mean(dst_matched, dims=1))
+            src_c = src_matched .- μ_src'
+            dst_c = dst_matched .- μ_dst'
+            
+            # Solve: dst_c ≈ src_c * A'  =>  A' = (src_c' * src_c) \ (src_c' * dst_c)
+            StS = src_c' * src_c
+            StD = src_c' * dst_c
+            A_refined = (StS \ StD)'  # 2×2 matrix
+            t_refined = μ_dst - A_refined * μ_src  # 2-vector
+            
+            # Update affine coefficients: [a0, a1, a2] for each dimension
+            ax = [t_refined[1], A_refined[1,1], A_refined[1,2]]
+            ay = [t_refined[2], A_refined[2,1], A_refined[2,2]]
+            
+            # Recompute TPS warping coefficients with fixed refined affine
+            # Use weighted targets from soft assignment (as before)
+            rowmass = sum(Areal, dims=2)
+            EY = similar(Xs, (N,2))
+            @inbounds for i in 1:N
+                m = rowmass[i]
+                if m <= eps()
+                    EY[i,1] = Xs[i,1]; EY[i,2] = Xs[i,2]
+                else
+                    s1 = 0.0; s2 = 0.0
+                    @inbounds for j in 1:M
+                        w = Areal[i,j]
+                        s1 += w * Ys[j,1]; s2 += w * Ys[j,2]
+                    end
+                    EY[i,1] = s1 / m; EY[i,2] = s2 / m
+                end
+            end
+            
+            # Solve for warping coefficients with fixed affine
+            wx, wy = _tps_solve_fixed_affine(Xs, EY, ax, ay; λ=λ)
+            
+            if verbose
+                println("Affine refinement complete.")
+            end
+        else
+            if verbose
+                println("Warning: Only $n_matched matched pairs, need ≥3 for affine refinement. Skipping.")
+            end
+        end
+    end
+    
     # Map affine constants back to original coordinates if centered:
     # f_orig(p) = a0' + A p + Σ w U(||p - X_j||), with a0' = a0 - A μX + μY
-    if center
-        a0x = ax[1] + μY[1] - (ax[2]*μX[1] + ax[3]*μX[2])
-        a0y = ay[1] + μY[2] - (ay[2]*μX[1] + ay[3]*μX[2])
-        ax = [a0x, ax[2], ax[3]]
-        ay = [a0y, ay[2], ay[3]]
-        # Note: weights wx/wy and centers X can stay in original coords (U uses distances, translation-invariant)
-    end
-
-    return (; wx, wy, ax, ay, A, Areal, p_src_out, p_dst_out, diag)
+    # Store scaled control points and coordinate transform info for tps_rpm_apply
+    # Parameters (wx, wy, ax, ay) stay in scaled space; tps_rpm_apply handles conversion
+    return (; wx, wy, ax, ay, A, Areal, p_src_out, p_dst_out, diag, 
+            Xctl=Xs, μX, μY, σX, center)
 end
 
 
 """
-    show_pos(sz, posmat, idxpos)
+    show_pos(sz, posmat, idxpos=1) -> Matrix{Float64}
 
-creates an image with the positions as dots and filled by the index (if present) plus one.
-    This yields unassigned sources having the number one.
+Create an image with positions marked as dots, labeled by index values.
+
+# Arguments
+- `sz::Tuple{Int,Int}`: output image size (height, width)
+- `posmat::AbstractMatrix`: N×2 matrix of (x, y) positions
+- `idxpos=1`: either a scalar (all dots same value) or Vector{Int} of per-point labels.
+  Values are stored as `idxpos[i] + 1`, so unassigned (0) becomes 1.
+
+# Returns
+- `Matrix{Float64}`: image of size `sz` with dots at positions
+
+# Example
+```julia
+positions = [50.0 100.0; 150.0 200.0]  # 2 points
+img = show_pos((256, 256), positions)  # all dots = 2
+img = show_pos((256, 256), positions, [0, 5])  # dots = 1, 6
+```
 """
 function show_pos(sz, posmat, idxpos=1)
     res = zeros(sz)
@@ -387,27 +857,75 @@ end
 
 
 """
-    tps_rpm_apply(X::AbstractMatrix, params::NamedTuple, Q::AbstractMatrix)
+    tps_rpm_apply(X::AbstractMatrix, params::NamedTuple, Q::AbstractMatrix) -> Matrix{Float64}
 
-Apply final warp to arbitrary points Q
+Apply the TPS warp to arbitrary query points.
 
-# Parameters
-* `X`: source coordinates of the warp
-* param: defines the thin plate spline in detail
-* `Q`: The positions to apply the warp to
+# Arguments
+- `X::AbstractMatrix`: source control points (ignored if `params` contains `Xctl`)
+- `params::NamedTuple`: TPS parameters from `tps_rpm` (contains `wx`, `wy`, `ax`, `ay`, etc.)
+- `Q::AbstractMatrix`: K×2 matrix of query points to transform
+
+# Returns
+- `Matrix{Float64}`: K×2 matrix of warped positions
+
+# Example
+```julia
+params = tps_rpm(X, Y; λ=1.0)
+X_warped = tps_rpm_apply(X, params, X)  # warp source points
+grid = make_grid_points(X, (512, 512); gridstep=20)
+grid_warped = tps_rpm_apply(X, params, grid)  # warp a grid
+```
 """
 function tps_rpm_apply(X::AbstractMatrix, params::NamedTuple, Q::AbstractMatrix)
-    _tps_apply(X, params.wx, params.wy, params.ax, params.ay, Q)
+    # Use stored control points (in scaled space)
+    Xctl = haskey(params, :Xctl) ? params.Xctl : X
+    
+    # Transform query points to scaled-centered space
+    μX = haskey(params, :μX) ? params.μX : zeros(2)
+    μY = haskey(params, :μY) ? params.μY : zeros(2)
+    σX = haskey(params, :σX) ? params.σX : 1.0
+    center = haskey(params, :center) ? params.center : false
+    
+    if center || haskey(params, :σX)
+        Qs = (Q .- μX') ./ σX
+    else
+        Qs = Q
+    end
+    
+    # Apply TPS in scaled space
+    result_s = _tps_apply(Xctl, params.wx, params.wy, params.ax, params.ay, Qs)
+    
+    # Transform result back to original coordinates
+    if center || haskey(params, :σX)
+        result = σX .* result_s .+ μY'
+    else
+        result = result_s
+    end
+    
+    return result
 end
 
 
 """
-    make_grid_points(inpts, sz; mystep::Int=1)
-Create grid points over an image of size (H,W). order=:xy or :yx.
+    make_grid_points(inpts, sz=nothing; gridstep=1) -> Matrix{Float64}
 
-# Parameters
-- inpts: input vector
-- sz: optional size to define the bounding box. If not given, the ranges are estimated by the bounding box of inpts.
+Create a grid of points for visualizing TPS warping.
+
+# Arguments
+- `inpts::AbstractMatrix`: N×2 point set (used for bounding box if `sz` is nothing)
+- `sz=nothing`: (height, width) tuple for grid bounds, or `nothing` to use bounding box of `inpts`
+- `gridstep::Int=1`: spacing between grid lines
+
+# Returns
+- `Matrix{Float64}`: K×2 matrix of grid points (horizontal + vertical lines)
+
+# Example
+```julia
+grid = make_grid_points(X, (512, 512); gridstep=20)
+grid_warped = tps_rpm_apply(X, params, grid)
+img_grid = show_pos((512, 512), grid_warped, 2)
+```
 """
 function make_grid_points(inpts, sz=nothing; gridstep::Int=1)
     xmin = 1; xmax = 100; ymin=1; ymax=100;
@@ -436,21 +954,28 @@ function make_grid_points(inpts, sz=nothing; gridstep::Int=1)
 end
 
 """
-    assigment_indices(X, Y, params; min_weight=0.2, max_outlier=0.5, mutual=true)
+    assigment_indices(X, Y, params; min_weight=0.2, max_outlier=0.5, mutual=true) -> Vector{Int}
 
-Return a source-to-destination assignment vector of length N:
-- assign[i] = j (1..M) if source i is matched to destination j
-- assign[i] = 0 if unmatched (assigned to dummy column)
+Return a source-to-destination assignment vector with filtering.
 
-Arguments:
-- X, Y: point sets (N×2, M×2)
-- params: result from `tps_rpm` (must contain `A`, `p_src_out`, `p_dst_out`)
-- min_weight: minimum row mass on best destination to accept a match
-        It require the best column for a source to carry enough mass.
-- max_outlier: max allowed outlier probability for source i and destination j
-        It rejects sources/destinations whose probability goes mostly to the outlier.
-- mutual: if true, require mutual best (i is the argmax in column j)
-        It enforces a simple 1–1 (mutual best) filter.
+# Arguments
+- `X::AbstractMatrix`: N×2 source point set
+- `Y::AbstractMatrix`: M×2 destination point set
+- `params`: NamedTuple from `tps_rpm` (must contain `A`, `p_src_out`, `p_dst_out`)
+- `min_weight::Float64=0.2`: minimum weight on best destination to accept match
+- `max_outlier::Float64=0.5`: maximum outlier probability for source and destination
+- `mutual::Bool=true`: if true, require mutual best match (1-1 correspondence)
+
+# Returns
+- `Vector{Int}`: length N, where `assign[i] = j` (1..M) if matched, `0` if unmatched
+
+# Example
+```julia
+params = tps_rpm(X, Y; λ=1.0)
+assign = assigment_indices(X, Y, params; min_weight=0.1, max_outlier=0.8)
+n_matched = count(>(0), assign)
+println("Matched \$n_matched of \$(size(X,1)) sources")
+```
 """
 function assigment_indices(X::AbstractMatrix, Y::AbstractMatrix, params;
                              min_weight::Float64=0.2,
@@ -490,6 +1015,36 @@ function assigment_indices(X::AbstractMatrix, Y::AbstractMatrix, params;
     return assign
 end
 
+"""
+    visualize_result(sz, X, Y, params; min_weight=0.0, max_outlier=10000.0, mutual=true, gridstep=15) -> Array{Float64,4}
+
+Create a visualization of the TPS-RPM matching result.
+
+# Arguments
+- `sz::Tuple{Int,Int}`: output image size (height, width)
+- `X::AbstractMatrix`: N×2 source point set (first argument to `tps_rpm`)
+- `Y::AbstractMatrix`: M×2 destination point set (second argument to `tps_rpm`)
+- `params`: NamedTuple from `tps_rpm`
+- `min_weight::Float64=0.0`: minimum weight for assignment filtering
+- `max_outlier::Float64=10000.0`: maximum outlier probability for filtering
+- `mutual::Bool=true`: require mutual best match
+- `gridstep::Int=15`: spacing for visualization grid lines
+
+# Returns
+- `Array{Float64,4}`: H×W×1×5 array with 5 visualization slices:
+  1. Source grid
+  2. Warped grid
+  3. Source points (colored by match index)
+  4. Warped source points
+  5. Destination reference points
+
+# Example
+```julia
+params = tps_rpm(X, Y; λ=1.0)
+res = visualize_result((512, 512), X, Y, params; gridstep=20)
+# View with: @vt res  (if using View5D)
+```
+"""
 function visualize_result(sz, X,Y, params; min_weight=0.0, max_outlier=10000.0, mutual=true, gridstep=15)
     grid = make_grid_points(X, sz; gridstep=gridstep);
     grid_warped = TPSRPM.tps_rpm_apply(X, params, grid)
