@@ -250,19 +250,12 @@ function get_affine_part(params; verbose=false)
               params.ay[2] params.ay[3]]
 
     # Translation: t = σX * a_s - A * μX + μY
-    # If refinement was done, use matched centroids for correct result
+    # Note: Always use original centering (μX, μY of all points).
+    # The Kabsch-computed a_s in scaled space already correctly encodes the
+    # matched-centroid information through the math.
     σX = haskey(params, :σX) ? params.σX : 1.0
-    
-    # Use matched centroids if available (from refinement), else full centroids
-    if haskey(params, :μX_matched)
-        μX = params.μX_matched
-        μY = params.μY_matched
-        use_matched = true
-    else
-        μX = haskey(params, :μX) ? params.μX : zeros(2)
-        μY = haskey(params, :μY) ? params.μY : zeros(2)
-        use_matched = false
-    end
+    μX = haskey(params, :μX) ? params.μX : zeros(2)
+    μY = haskey(params, :μY) ? params.μY : zeros(2)
     center = haskey(params, :center) ? params.center : false
     
     a_s = [params.ax[1], params.ay[1]]
@@ -271,8 +264,8 @@ function get_affine_part(params; verbose=false)
         println("  a_s (scaled translation) = ", a_s)
         println("  matrix = ", matrix)
         println("  σX = ", σX)
-        println("  μX = ", μX, use_matched ? " (matched)" : " (all)")
-        println("  μY = ", μY, use_matched ? " (matched)" : " (all)")
+        println("  μX = ", μX)
+        println("  μY = ", μY)
         println("  center = ", center)
         println("  A*μX = ", matrix * μX)
         println("  σX*a_s = ", σX .* a_s)
@@ -854,6 +847,11 @@ function tps_rpm(X::AbstractMatrix, Y::AbstractMatrix; beta_sched=collect(0.5:0.
                                                        beta=last(beta_sched),
                                                        cout_src=cout_src_val, cout_dst=cout_dst_val)
 
+    # Initialize matched centroid variables (will be set if refinement runs)
+    μX_matched_scaled = nothing
+    μY_matched_scaled = nothing
+    final_hard_assign = nothing  # Store final assignment from refinement
+    
     # Optional: refine affine using hard assignment and recompute TPS
     if refine_affine
         # Convert refine_max_dist to scaled coordinates
@@ -952,6 +950,9 @@ function tps_rpm(X::AbstractMatrix, Y::AbstractMatrix; beta_sched=collect(0.5:0.
             
             # Solve for warping coefficients with fixed affine
             wx, wy = _tps_solve_fixed_affine(Xs, EY, ax, ay; λ=λ)
+            
+            # Store the final hard assignment used
+            final_hard_assign = hard_assign
         end
         
         if verbose
@@ -964,13 +965,14 @@ function tps_rpm(X::AbstractMatrix, Y::AbstractMatrix; beta_sched=collect(0.5:0.
     # Store scaled control points and coordinate transform info for tps_rpm_apply
     # Parameters (wx, wy, ax, ay) stay in scaled space; tps_rpm_apply handles conversion
     
-    # If refinement was done, store matched centroids for correct affine extraction
-    if refine_affine && @isdefined(μX_matched_scaled) && @isdefined(μY_matched_scaled)
+    # If refinement was done, store matched centroids and final hard assignment
+    if refine_affine && !isnothing(μX_matched_scaled) && !isnothing(μY_matched_scaled)
         # Convert matched centroids back to original coordinates
         μX_matched = σX .* μX_matched_scaled .+ μX
         μY_matched = σX .* μY_matched_scaled .+ μY
         return (; wx, wy, ax, ay, A, Areal, p_src_out, p_dst_out, diag, 
-                Xctl=Xs, μX, μY, σX, center, μX_matched, μY_matched)
+                Xctl=Xs, μX, μY, σX, center, μX_matched, μY_matched, 
+                refine_hard_assign=final_hard_assign)
     else
         return (; wx, wy, ax, ay, A, Areal, p_src_out, p_dst_out, diag, 
                 Xctl=Xs, μX, μY, σX, center)
